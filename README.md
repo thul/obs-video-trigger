@@ -158,6 +158,19 @@ The optimized Windows GUI-subsystem binary is currently under 1 MB. Releases are
 by the Rust CI workflow and include `SHA256SUMS.txt`. The version in a release tag must
 match `Cargo.toml`.
 
+Prepare and publish a release from a clean `main` branch with:
+
+```powershell
+.\scripts\prepare-release.ps1 1.2.0
+git add Cargo.toml Cargo.lock
+git commit -m "Release v1.2.0"
+.\scripts\tag-release.ps1 -Push
+```
+
+The preparation script updates both Cargo files and runs formatting, linting, and tests.
+The tagging script derives the tag from Cargo metadata, pushes the commit first, and only
+then pushes the matching tag that starts the release workflow.
+
 The unsigned download may initially trigger SmartScreen. Right-click the executable →
 **Properties** → **Unblock**, or choose **More info → Run anyway** once. PowerShell users
 can run `Unblock-File .\obs-video-trigger.exe`.

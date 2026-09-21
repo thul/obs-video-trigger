@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "obs-video-trigger"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "axum",
  "futures-util",
