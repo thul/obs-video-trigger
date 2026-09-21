@@ -1,98 +1,175 @@
 # obs-video-trigger
 
-A single Windows executable that plays a video clip **once** in an OBS browser source —
-fullscreen, unmuted, no controls — and leaves the source transparent again when the clip
-ends. Triggered by opening a URL or running the binary with a path, so it works from a
-Stream Deck, a chat bot, a batch file, or anything else that can open and reach the URL.
+A small native Windows application for playing local video clips over an OBS scene. A
+clip appears fullscreen in an OBS browser source, plays with sound, and leaves the source
+transparent when it ends. Trigger it from the native manager, a URL, the command line, a
+Stream Deck, or any other launcher that can make an HTTP request.
 
-- One static `.exe`, no runtime, no installer, no config file.
-- Runs as a background daemon with a tray icon.
-- Any video file on disk; nothing has to be copied into a special folder.
-- Same clip triggered again while playing → stops it. Different clip → replaces it.
-- Audio goes through the OBS browser source by default, or to a Windows output device of
-  your choice with `--audio-device`.
+- One native Rust `.exe`; no runtime, installer, or configuration file.
+- Native dark-mode manager and Windows tray icon.
+- Play files from anywhere on disk without copying them into a special directory.
+- Seamlessly replace the visible clip using a preloaded second player.
+- Run a folder as continuously reshuffled playback, with one-video lookahead.
+- Scrub, pause/resume, stop, skip to the next folder video, and inspect time/duration.
+- Generate and copy correctly URL-encoded file and folder triggers from the GUI.
+- Silent native success/error notifications with copy and dismiss controls.
+- Persistent diagnostics for media, queue, HTTP-range, and WebSocket problems.
+- Route audio through OBS or to a selected Windows output device.
 
-## Documentation
+## Quick start
 
-| Document | For |
-|---|---|
-| [QUICKSTART.md](QUICKSTART.md) | Streamers. Five steps: run it, add it to OBS, add a Stream Deck key, press. |
-| [REFERENCE.md](REFERENCE.md) | Every option, from the command line and from a browser. Tray menu, OBS settings, playback rules, HTTP API, clip formats, troubleshooting. |
+1. Run `obs-video-trigger.exe`. The blue play icon appears in the notification area.
+2. Single-click the tray icon (or right-click → **Open manager**).
+3. Click **Select…** and choose a video, or drag a video into the manager.
+4. Add `http://127.0.0.1:4466/overlay` as an OBS **Browser** source. Set it to your
+   canvas size and keep **Shutdown source when not visible** and
+   **Refresh browser when scene becomes active** unticked.
+5. Click **Play**, or click **Copy URL** and assign the copied trigger URL to a Stream Deck
+   **System → Website** action.
 
-## Build
+See [QUICKSTART.md](QUICKSTART.md) for the complete first-run walkthrough and
+[REFERENCE.md](REFERENCE.md) for command-line and HTTP details.
 
-Requires [Bun](https://bun.sh) 1.4 or newer on the build machine only.
+## Native manager
 
+Open the manager with a single click on the tray icon, from **Open manager** in its
+context menu, or by double-clicking the icon.
+
+### Choose media
+
+- Drag a supported video file or folder anywhere into the window.
+- Or click **Select…**. Choose a video normally; to choose a folder, browse into it,
+  leave **Select this folder** in the **File name** box, and click **Open**.
+- The manager shows the real Windows path and creates a reusable, URL-encoded trigger.
+- **Copy URL** copies that trigger for Stream Deck, a browser, or another launcher.
+- Dropping or selecting a video while anything is active immediately leaves folder mode
+  and replaces the playing clip. While idle, it only prepares the selection.
+
+### Playback controls
+
+- **Play / Pause / Resume** starts the selected trigger or controls the active video.
+- **Stop** hides the video and clears an active folder queue.
+- **Next** appears during folder playback and advances to the next shuffled video.
+- **Overlay** opens the OBS overlay page in the default browser.
+- **Exit** shuts down the daemon.
+- The scrubber supports click-to-seek and drag-to-preview; the seek is committed on mouse
+  release. Time and duration appear on the right. Folder mode also shows `Video N/total`
+  on the left.
+
+Buttons have hover, pressed, and status feedback. The manager follows the Windows dark
+theme, carries the application icon, opens on the monitor containing the pointer, and
+repaints only when its state changes.
+
+## Folder playback
+
+Selecting or dropping a directory creates a `/play-folder` trigger. Starting it collects
+the supported videos directly inside that folder, shuffles them, and plays each file once
+per cycle. At the end of a cycle the same folder is shuffled again; different folders are
+never merged, and the shuffle avoids repeating the boundary video immediately.
+
+The next video is reserved from the queue and preloaded in a second, fresh media element
+so a normal transition can swap without exposing the OBS scene underneath. **Next**
+consumes that reserved video. **Stop** clears the queue, so the next folder start creates
+a fresh shuffle.
+
+## Tray, notifications, and diagnostics
+
+The tray tooltip and context menu identify the app as **OBS Video Overlay**. The menu can
+open the manager or overlay, copy the overlay URL, hide playback, open the diagnostics
+log, or exit.
+
+Notifications are custom native popups and do not play the Windows notification sound.
+Errors have a red left edge; informational messages use blue. A popup appears on the
+monitor containing the pointer and includes **Copy** and **Dismiss** buttons.
+
+Diagnostics are appended and flushed immediately to:
+
+- `$XDG_STATE_HOME/obs-video-trigger/diagnostics.log`, when `XDG_STATE_HOME` is set.
+- `%LOCALAPPDATA%\obs-video-trigger\diagnostics.log` otherwise.
+
+Use tray menu → **Open diagnostics log**. It records queue/token transitions, media source
+and readiness events, preload/swap decisions, seeks and recovery, WebSocket reconnects,
+and HTTP byte-range requests. It does not contain video data, but it does contain local
+file paths.
+
+## Command line
+
+```powershell
+obs-video-trigger.exe                              # start daemon + tray
+obs-video-trigger.exe --play "C:\Clips\intro.mp4"
+obs-video-trigger.exe "C:\Clips\intro.mp4"       # same as --play
+obs-video-trigger.exe --play-folder "C:\Clips\Break"
+obs-video-trigger.exe --stop
+obs-video-trigger.exe --status
+obs-video-trigger.exe --list-audio-devices
 ```
-bun install
-bun run build
-```
 
-Produces `dist/obs-video-trigger.exe` (~86 MB — it embeds the Bun runtime). The build
-targets `bun-windows-x64` and uses `--windows-hide-console`, so neither the daemon nor a
-trigger ever opens a console window. Run from an existing terminal, the exe attaches to
-that terminal (`src/console.ts`) so `--help`, the daemon log and error messages still
-show; because it is a GUI-subsystem program the shell does not wait for it, so the output
-lands after the prompt and `%ERRORLEVEL%` is not set — use `start /wait` when a script
-needs the exit code. The file version stamped into the exe is taken from `package.json`; the release
-workflow refuses a tag that does not match it. Releases ship a `SHA256SUMS.txt` next to
-the exe, so a download can be checked with `certutil -hashfile obs-video-trigger.exe SHA256`.
-
-The binary is unsigned, so Windows shows "Windows protected your PC" the first time a
-downloaded copy runs. Two ways past it:
-
-- **One time:** click **More info → Run anyway**.
-- **Permanently, before the first run:** right-click `obs-video-trigger.exe` →
-  **Properties** → tick **Unblock** at the bottom of the General tab → **OK**. This
-  removes the "downloaded from the internet" mark, and SmartScreen no longer asks.
-  Equivalent in PowerShell: `Unblock-File .obs-video-trigger.exe`.
-
-## Develop
-
-```
-bun run src/main.ts            # daemon from source, tray icon included
-bun run src/main.ts --play x   # trigger from source
-bun test                       # overlay, daemon, CLI and parser tests
-bun run typecheck              # tsc --noEmit
-bun run check                  # both
-```
-
-Layout: `src/main.ts` is the process boundary (arguments, exit codes, tray, signals);
-`src/server.ts` is the HTTP daemon, `src/client.ts` the `--play`/`--stop`/`--status`
-side, `src/args.ts` and `src/range.ts` the pure parsers, `src/overlay.ts` the browser page,
-`src/tray.ts` the PowerShell tray helper and `src/console.ts` the terminal output of a
-console-less exe. Tests start the daemon on a random port and
-talk to it over real HTTP.
-
-The daemon stamps the overlay page with a hash of its HTML and announces that version on
-the event stream, so an overlay left open in OBS reloads itself after a rebuild.
+Daemon options are `--host`, `--port`, `--audio-device`, and `--no-tray`. Play and folder
+triggers accept `--volume 0..1` and `--fit contain|cover|fill`. Run with `--help` or see
+[REFERENCE.md](REFERENCE.md) for all behavior and HTTP endpoints.
 
 ## How it works
 
-```
-Stream Deck ──GET /play?file=…──▶ daemon (127.0.0.1:4466) ──SSE──▶ overlay page in OBS
-                                       ▲                              │
-                                       └────── GET /media/<id> ◀──────┘ (range requests)
+```text
+Manager / Stream Deck / CLI
+          │ HTTP
+          ▼
+daemon on 127.0.0.1:4466 ─── WebSocket ───▶ overlay page in OBS
+          ▲                                      │
+          └──────── GET /media/<id> ─────────────┘  byte-range media
 ```
 
-1. The daemon listens on `127.0.0.1:4466`. Port 4455 is avoided because obs-websocket
-   uses it.
-2. `/play` checks the file exists, registers it under an id, and broadcasts a `play` event
-   to every connected overlay over server-sent events.
-3. The overlay page sets `<video src="/media/<id>">`, plays it unmuted, and hides itself
-   on `ended`. A second `play` for the same file toggles it off; any other file replaces
-   it. With `--audio-device` the page routes its audio to that device with `setSinkId()`;
-   it reports the devices it can see to the daemon so `--list-audio-devices` can show
-   them.
-4. Only files that have been registered through `/play` are served from `/media`, so the
-   page cannot be used to read arbitrary files. Browser requests from other sites are
-   refused on `/play` and `/stop`, and a non-loopback `Host` header is refused everywhere
-   while bound to loopback, so a web page cannot fire clips or read files through a
-   DNS-rebinding trick.
-5. The tray icon is a hidden `powershell.exe` running a Windows Forms `NotifyIcon`. "Stop
-   daemon" calls `/shutdown` with a per-run token. The daemon holds the helper's stdin;
-   when the daemon exits for any reason the pipe closes and the helper disposes the icon
-   cleanly. A failed `/status` poll is the fallback.
+The daemon validates and registers local paths, broadcasts tokenized commands over one
+bidirectional WebSocket, and serves only registered files from `/media/<id>`. The overlay
+reports visible playback state, time, errors, and completion over the same connection.
+Tokens keep delayed events from an old player from changing the current queue.
+
+The overlay uses two media slots, but creates a fresh `<video>` element for every new
+source assignment so Chromium cannot leak stale decoder events into the next clip. It
+preloads the reserved folder item, swaps only after the new media says it can play, and
+has bounded recovery for browser seek stalls.
+
+Loopback host validation and same-origin checks prevent unrelated web pages from firing
+clips or reading local files. The overlay HTML carries a version hash and reloads itself
+after a daemon update.
+
+## Supported media
+
+The folder scanner recognizes `.mp4`, `.webm`, `.mov`, `.m4v`, `.mkv`, and `.ogv`.
+Actual playback depends on whether the codec inside the file is supported by OBS's
+Chromium browser; H.264/AAC MP4 and VP8/VP9 WebM are the safest choices. WebM is also the
+usual choice when the video needs an alpha channel. See
+[REFERENCE.md](REFERENCE.md#clip-formats-and-preparation) for preparation guidance.
+
+## Build and develop
+
+Requires Rust 1.95 or newer on the build machine only.
+
+```powershell
+cargo build --release
+Copy-Item target/release/obs-video-trigger.exe dist/obs-video-trigger.exe
+
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+The optimized Windows GUI-subsystem binary is currently under 1 MB. Releases are built
+by the Rust CI workflow and include `SHA256SUMS.txt`. The version in a release tag must
+match `Cargo.toml`.
+
+The unsigned download may initially trigger SmartScreen. Right-click the executable →
+**Properties** → **Unblock**, or choose **More info → Run anyway** once. PowerShell users
+can run `Unblock-File .\obs-video-trigger.exe`.
+
+Source layout:
+
+- `src/main.rs` — process entry and daemon setup.
+- `src/server.rs` — HTTP, WebSocket, media serving, and folder queue.
+- `src/overlay.html` / `src/overlay.rs` — OBS player and embedded page versioning.
+- `src/tray.rs` — native tray, manager, popup, picker, and playback UI.
+- `src/client.rs` / `src/args.rs` — command client and argument parser.
+- `src/diagnostics.rs` — persistent event timeline.
 
 ## License
 

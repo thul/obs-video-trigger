@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OBS video overlay</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+  }
+  .player {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
+    background: transparent;
+    opacity: 0;
+    visibility: hidden;
+  }
+  .player.visible {
+    opacity: 1;
+    visibility: visible;
+  }
+  #status {
+    position: fixed;
+    left: 8px;
+    bottom: 8px;
+    z-index: 10;
+    font: 12px/1.4 system-ui, sans-serif;
+    color: #fff;
+    background: rgba(0, 0, 0, .6);
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: none;
+  }
+  body.debug #status { display: block; }
+</style>
+</head>
+<body>
+  <video id="player-a" class="player" playsinline preload="auto"></video>
+  <video id="player-b" class="player" playsinline preload="auto"></video>
+  <div id="status">waiting</div>
+<script>
+(function () {
+  var players = [document.getElementById('player-a'), document.getElementById('player-b')];
+  var statusBox = document.getElementById('status');
+  var active = null;
+  var pending = null;
+  var preloaded = null;
+  var currentFile = null;
+  var generation = 0;
+  var PAGE_VERSION = '__OVERLAY_VERSION__';
+  var outputs = [];
+  var lastProgress = 0;
+  var socket = null;
+  var pendingTerminal = null;
+  var endWatch = null;
+  var seekWatch = null;
+  var seekSerial = 0;
+  var lastEndDiagnostic = 0;
+  function send(message) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(message));
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function sendTerminal(message) {
+    pendingTerminal = message;
+    send(message);
+  }
+
+  function diagnostic(name, player, event, detail) {
+    event = event || (player && player._event);
+    var fields = [
+      name,
+      'token=' + (event && event.token != null ? event.token : '-'),
+      'file=' + (event && event.file ? event.file : '-'),
+      'active=' + (player === active),
+      'pending=' + (player === pending),
+      'preloaded=' + (player === preloaded)
+    ];
+    if (player) {
+      fields.push('time=' + (isFinite(player.currentTime) ? player.currentTime.toFixed(3) : '?'));
+      fields.push('duration=' + (isFinite(player.duration) ? player.duration.toFixed(3) : '?'));
+      fields.push('ready=' + player.readyState);
+      fields.push('network=' + player.networkState);
+      fields.push('paused=' + player.paused);
+      fields.push('ended=' + player.ended);
+      fields.push('src=' + (player.currentSrc || player.getAttribute('src') || '-'));
+    }
+    if (detail) fields.push('detail=' + detail);
+    send({ type: 'diagnostic', message: fields.join(' ') });
+  }
+
+  if (new URLSearchParams(location.search).has('debug')) document.body.classList.add('debug');
+
+  function status(text) { statusBox.textContent = text; }
+
+  function clearPlayer(player) {
+    player.classList.remove('visible');
+    player.pause();
+    player.oncanplay = null;
+    player.onloadedmetadata = null;
+    player.removeAttribute('src');
+    player.load();
+    player._event = null;
+    player._preloadReady = false;
+  }
+
+  function freshPlayer(player) {
+    var index = players.indexOf(player);
+    if (pending === player) pending = null;
+    if (preloaded === player) preloaded = null;
+    clearPlayer(player);
+    var replacement = document.createElement('video');
+    replacement.id = player.id;
+    replacement.className = 'player';
+    replacement.playsInline = true;
+    replacement.preload = 'auto';
+    player.replaceWith(replacement);
+    players[index] = replacement;
+    wirePlayer(replacement);
+    diagnostic('fresh-player', replacement, null, 'slot=' + index);
+    return replacement;
+  }
+
+  function hide(keepPreloaded) {
+    generation++;
+    if (endWatch) clearTimeout(endWatch);
+    endWatch = null;
+    if (seekWatch) clearTimeout(seekWatch);
+    seekWatch = null;
+    players.forEach(function (player) {
+      if (!keepPreloaded || player !== preloaded) clearPlayer(player);
+    });
+    active = null;
+    pending = null;
+    if (!keepPreloaded) preloaded = null;
+    currentFile = null;
+    status('waiting');
+  }
+
+  // Routes one player to the output device requested by the daemon. Each
+  // player remembers its own sink because clips alternate between them.
+  function applySink(player, name) {
+    if (!player.setSinkId) return;
+    var wanted = '';
+    if (name) {
+      var lower = name.toLowerCase();
+      for (var i = 0; i < outputs.length; i++) {
+        if (outputs[i].id === name || outputs[i].label.toLowerCase().indexOf(lower) !== -1) {
+          wanted = outputs[i].id;
+          break;
+        }
+      }
+      if (!wanted) status('audio device not found: ' + name + ', using default');
+    }
+    if (wanted === (player._sink || '')) return;
+    player._sink = wanted;
+    var result = player.setSinkId(wanted);
+    if (result && result.catch) {
+      result.catch(function (err) {
+        status('audio device rejected (' + err.name + '), using default');
+        player._sink = '';
+        player.setSinkId('').catch(function () {});
+      });
+    }
+  }
+
+  function begin(event) {
+    if (pendingTerminal && pendingTerminal.token !== event.token) pendingTerminal = null;
+    if (endWatch) clearTimeout(endWatch);
+    endWatch = null;
+    if (seekWatch) clearTimeout(seekWatch);
+    seekWatch = null;
+    var wasPreloaded = preloaded && preloaded._event && preloaded._event.file === event.file;
+    var next = wasPreloaded ? preloaded : (active === players[0] ? players[1] : players[0]);
+    var preloadReady = !!(wasPreloaded && next._preloadReady);
+    if (wasPreloaded) preloaded = null;
+    if (pending && pending !== next) clearPlayer(pending);
+    if (next !== active && !wasPreloaded) next = freshPlayer(next);
+    pending = next;
+    diagnostic('begin', next, event, 'wasPreloaded=' + !!wasPreloaded);
+
+    var mine = ++generation;
+    next._event = event;
+    next.style.objectFit = event.fit || 'contain';
+    next.volume = typeof event.volume === 'number' ? event.volume : 1;
+    next.muted = false;
+    applySink(next, event.sink || '');
+
+    function ready() {
+      if (mine !== generation || pending !== next) return;
+      diagnostic('canplay-ready', next, event);
+      next.oncanplay = null;
+      next._preloadReady = false;
+
+      // Start and reveal the ready player before clearing the old one, so the
+      // browser source never exposes the scene underneath during a swap.
+      var previous = active;
+      var started = next.play();
+      active = next;
+      pending = null;
+      currentFile = event.file;
+      next.style.zIndex = previous === players[0] ? '2' : '1';
+      next.classList.add('visible');
+      if (previous && previous !== next) clearPlayer(previous);
+      status('playing ' + event.name);
+      diagnostic('visible', next, event);
+      send({
+        type: 'playing', token: event.token, time: next.currentTime,
+        duration: isFinite(next.duration) ? next.duration : 0, paused: next.paused
+      });
+
+      if (started && started.then) {
+        started.then(function () {
+          if (mine === generation) diagnostic('play-resolved', next, event);
+        }, function (err) {
+          if (mine !== generation || err.name === 'AbortError') return;
+          diagnostic('play-rejected', next, event, err.name + ':' + err.message);
+          status('autoplay blocked (' + err.name + '), retrying muted');
+          next.muted = true;
+          next.play().catch(function () {
+            if (mine === generation) hide();
+          });
+        });
+      }
+    }
+
+    next.oncanplay = ready;
+    if (!wasPreloaded) {
+      next.src = event.src;
+      next.load();
+    }
+    if (preloadReady) ready();
+    status(active ? 'buffering ' + event.name : 'loading ' + event.name);
+  }
+
+  function preload(event) {
+    var next = active === players[0] || pending === players[0] ? players[1] : players[0];
+    if (next === active || next === pending) return;
+    if (preloaded && preloaded !== next) clearPlayer(preloaded);
+    next = freshPlayer(next);
+    next._event = event;
+    next.style.objectFit = event.fit || 'contain';
+    next.volume = typeof event.volume === 'number' ? event.volume : 1;
+    applySink(next, event.sink || '');
+    next.src = event.src;
+    next._preloadReady = false;
+    next.oncanplay = function () {
+      if (next !== preloaded || next._event !== event) return;
+      next._preloadReady = true;
+      next.oncanplay = null;
+      diagnostic('preload-ready', next, event);
+    };
+    preloaded = next;
+    next.load();
+    diagnostic('preload', next, event);
+  }
+
+  function wirePlayer(player) {
+    player.addEventListener('timeupdate', function () {
+      if (player !== active || !isFinite(player.duration)) return;
+      var now = Date.now();
+      if (now - lastProgress < 200) return;
+      lastProgress = now;
+      send({ type: 'progress', token: player._event && player._event.token, time: player.currentTime, duration: player.duration, paused: player.paused });
+      var remaining = player.duration - player.currentTime;
+      if (remaining >= 0 && remaining < 2 && now - lastEndDiagnostic >= 250) {
+        lastEndDiagnostic = now;
+        diagnostic('near-end', player);
+      }
+      if (remaining >= 0 && remaining < 1 && !endWatch) {
+        var watchedTime = player.currentTime;
+        endWatch = setTimeout(function () {
+          endWatch = null;
+          if (player !== active || player.paused || !player._event) return;
+          if (player.ended || (player.duration - player.currentTime < 0.25 && player.currentTime <= watchedTime + 0.02)) {
+            var event = player._event;
+            diagnostic('end-watchdog', player, event, 'watchedTime=' + watchedTime.toFixed(3));
+            sendTerminal({ type: 'ended', token: event.token });
+            hide(true);
+          }
+        }, Math.max(1500, remaining * 1000 + 1000));
+      }
+    });
+    player.addEventListener('ended', function () {
+      if (player !== active) return;
+      var event = player._event;
+      diagnostic('ended-event', player, event);
+      if (event) {
+        sendTerminal({ type: 'ended', token: event.token });
+      }
+      hide(true);
+    });
+
+    player.addEventListener('error', function () {
+      if (!player.getAttribute('src')) return;
+      var event = player._event;
+      diagnostic('error-event', player, event, player.error ? player.error.code + ':' + player.error.message : 'unknown');
+      if (player === pending) {
+        clearPlayer(player);
+        pending = null;
+        status('error loading ' + (event ? event.name : 'clip'));
+      } else if (player === active) {
+        if (event) sendTerminal({ type: 'error', token: event.token, file: event.file, error: 'browser could not decode or load the clip' });
+        hide();
+      }
+      if (player !== active && (!event || !event.token)) {
+        send({ type: 'error', file: event ? event.file : '', error: 'browser could not decode or load the clip' });
+      }
+    });
+    ['playing', 'waiting', 'stalled', 'suspend', 'abort'].forEach(function (name) {
+      player.addEventListener(name, function () {
+        if (player === active || player === pending || player === preloaded) diagnostic(name + '-event', player);
+      });
+    });
+  }
+
+  players.forEach(wirePlayer);
+
+  // Only the page can enumerate browser-specific audio output ids, so it
+  // reports them to the daemon and keeps a local copy for sink matching.
+  var media = navigator.mediaDevices;
+
+  function listOutputs() {
+    return media.enumerateDevices().then(function (devices) {
+      return devices.filter(function (device) { return device.kind === 'audiooutput'; });
+    });
+  }
+
+  function reportDevices() {
+    if (!media || !media.enumerateDevices) return;
+    listOutputs()
+      .then(function (devices) {
+        var unlabeled = devices.length > 0 && devices.every(function (device) {
+          return !device.label;
+        });
+        if (!unlabeled || !media.getUserMedia) return devices;
+        return media.getUserMedia({ audio: true }).then(function (stream) {
+          stream.getTracks().forEach(function (track) { track.stop(); });
+          return listOutputs();
+        }, function () { return devices; });
+      })
+      .then(function (devices) {
+        outputs = devices.map(function (device) {
+          return { id: device.deviceId, label: device.label || '' };
+        });
+        send({ type: 'devices', devices: outputs });
+      })
+      .catch(function () {});
+  }
+
+  if (media && media.addEventListener) media.addEventListener('devicechange', reportDevices);
+  reportDevices();
+
+  function connect() {
+    socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    socket.onopen = function () {
+      status('connected');
+      diagnostic('ws-open', null, pendingTerminal);
+      if (pendingTerminal) send(pendingTerminal);
+      reportDevices();
+    };
+    socket.onclose = function (event) {
+      status('disconnected, reconnecting');
+      setTimeout(connect, 500);
+    };
+    socket.onmessage = function (message) {
+    var event;
+    try { event = JSON.parse(message.data); } catch (err) { return; }
+
+    if (event.type === 'hello') {
+      if (event.version !== PAGE_VERSION) location.reload();
+      return;
+    }
+    if (event.type === 'stop') {
+      hide();
+      return;
+    }
+    if (event.type === 'seek') {
+      if (active && isFinite(event.time)) {
+        var seekingPlayer = active;
+        var seekingEvent = active._event;
+        var target = Math.max(0, Math.min(event.time, isFinite(active.duration) ? active.duration : event.time));
+        var resume = !active.paused;
+        diagnostic('seek-command', active, seekingEvent, 'target=' + target.toFixed(3));
+        if (isFinite(active.duration) && target >= active.duration - 0.5) {
+          diagnostic('seek-end-zone', active, seekingEvent, 'target=' + target.toFixed(3));
+          sendTerminal({ type: 'ended', token: seekingEvent && seekingEvent.token });
+          hide(true);
+          return;
+        }
+        active.currentTime = target;
+        if (resume) active.play().catch(function () {});
+        var serial = ++seekSerial;
+        if (seekWatch) clearTimeout(seekWatch);
+        seekWatch = setTimeout(function () {
+          seekWatch = null;
+          if (serial !== seekSerial || seekingPlayer !== active) return;
+          var reachedTarget = resume
+            ? seekingPlayer.currentTime >= target - 0.75
+            : Math.abs(seekingPlayer.currentTime - target) < 0.75;
+          if (seekingPlayer.readyState >= 2 && !seekingPlayer.seeking && reachedTarget) {
+            diagnostic('seek-confirmed', seekingPlayer, seekingEvent, 'target=' + target.toFixed(3));
+            return;
+          }
+          diagnostic('seek-hard-reload', seekingPlayer, seekingEvent, 'target=' + target.toFixed(3));
+          seekingPlayer.pause();
+          seekingPlayer.src = seekingEvent.src + '?reload=' + serial;
+          seekingPlayer.onloadedmetadata = function () {
+            if (serial !== seekSerial || seekingPlayer !== active) return;
+            seekingPlayer.onloadedmetadata = null;
+            seekingPlayer.currentTime = target;
+            if (resume) seekingPlayer.play().catch(function () {});
+          };
+          seekingPlayer.load();
+          seekWatch = setTimeout(function () {
+            seekWatch = null;
+            if (serial !== seekSerial || seekingPlayer !== active || seekingPlayer.readyState >= 2) return;
+            diagnostic('seek-recovery-failed', seekingPlayer, seekingEvent, 'target=' + target.toFixed(3));
+            sendTerminal({ type: 'error', token: seekingEvent.token, file: seekingEvent.file, error: 'browser stalled while seeking' });
+            hide(true);
+          }, 3000);
+        }, 1500);
+      }
+      return;
+    }
+    if (event.type === 'pause') {
+      if (active) {
+        if (event.paused) active.pause(); else active.play().catch(function () {});
+        send({ type: 'progress', token: active._event && active._event.token, time: active.currentTime, duration: active.duration, paused: active.paused });
+      }
+      return;
+    }
+    if (event.type === 'preload') {
+      diagnostic('recv-preload', null, event);
+      preload(event);
+      return;
+    }
+    if (event.type !== 'play') return;
+
+    diagnostic('recv-play', null, event, 'replay=' + !!event.replay);
+
+    if (pendingTerminal && pendingTerminal.token === event.token && event.replay) return;
+    if (pendingTerminal && pendingTerminal.token !== event.token) pendingTerminal = null;
+
+    if (active && currentFile === event.file) {
+      if (event.replay) return;
+      status('toggled off ' + event.name);
+      hide();
+      return;
+    }
+    begin(event);
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

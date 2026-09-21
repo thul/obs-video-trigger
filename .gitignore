@@ -1,5 +1,5 @@
-dist/
-node_modules/
-videos/
+/dist/
+/target/
+/videos/
 *.7z
 *.zip

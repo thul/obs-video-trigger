@@ -31,11 +31,13 @@ For the five-minute version, see [QUICKSTART.md](QUICKSTART.md).
 |---|---|
 | `obs-video-trigger.exe` (no arguments) | **Daemon.** Runs in the background, shows a tray icon, serves the overlay page. |
 | `obs-video-trigger.exe --play <file>` (or any other option) | **Trigger.** Sends one command to the running daemon, then exits. |
+| `obs-video-trigger.exe --play-folder <folder>` | **Folder mode.** Randomly plays supported clips continuously; run it again for the same folder to stop. |
 
 The daemon hosts a small web page at `http://127.0.0.1:4466/overlay`. OBS loads that
-page as a browser source. The page is a single fullscreen `<video>` element with no
-controls and a transparent background. It stays invisible until a trigger arrives, plays
-the requested file once, unmuted, and clears itself the moment the file ends.
+page as a browser source. The page uses two fullscreen media slots with no controls and
+a transparent background. It creates a fresh `<video>` element for each source assignment
+and preloads a replacement before removing the visible clip. It clears itself when
+playback ends.
 
 Triggers reach the daemon over HTTP on port 4466. The command line is a thin wrapper
 around that HTTP call, so anything that can open a URL can trigger a clip too.
@@ -59,7 +61,7 @@ Only one daemon can run per port. Starting a second one prints
 
 ### Stopping
 
-- Right-click the tray icon → **Stop daemon**.
+- Right-click the tray icon → **Exit**.
 - Ctrl+C in the terminal it was started from.
 - Task Manager → end `obs-video-trigger.exe`.
 
@@ -114,22 +116,37 @@ Two things to know:
 
 ## The tray icon
 
-A blue disc with a white play triangle, next to the clock. Windows may tuck it behind
+An application icon next to the clock. Windows may tuck it behind
 the **^** overflow arrow.
 
 | Action | Result |
 |---|---|
+| Single-click | Opens the native manager. |
+| Right-click → **Open manager** | Opens the native manager. |
 | Right-click → **Open overlay page** | Opens `http://127.0.0.1:4466/overlay` in your default browser. Useful to confirm the daemon is up; a normal browser will show the clip but may mute it (see [Playback behaviour](#playback-behaviour)). |
 | Right-click → **Copy overlay URL** | Copies the overlay URL to the clipboard, ready to paste into OBS. |
 | Right-click → **Hide the playing clip** | Same as `--stop`. Takes the current clip off screen immediately. |
-| Right-click → **Stop daemon** | Shuts the daemon down and removes the icon. |
-| Double-click | Same as **Open overlay page**. |
-| Hover | Tooltip shows the address the daemon is listening on. |
+| Right-click → **Open diagnostics log** | Opens the persistent media, queue, WebSocket, and HTTP-range event timeline. |
+| Right-click → **Exit** | Shuts the daemon down and removes the icon. |
+| Double-click | Opens the native manager. |
+| Hover | Shows the **OBS Video Overlay** tooltip. |
 
-The icon is drawn by a hidden helper process that the daemon starts and stops. If the
-daemon dies for any reason, the icon disappears within a few seconds. If the icon is
-missing but clips work, PowerShell is blocked on the machine — use Task Manager to stop
-the daemon.
+The icon, menu and error popup are native Win32 UI owned by the daemon. If the daemon
+dies, Windows removes the icon. No helper process is involved.
+
+Bad paths and clips the OBS browser cannot decode appear in a small silent popup near
+the taskbar. These errors are never drawn in the browser source.
+
+The dark native manager accepts files and folders by drag-and-drop or through its single
+**Select…** dialog. It displays and copies the URL-encoded trigger, and provides a
+scrubber, time/duration, **Play/Pause/Resume**, **Stop**, **Next** during folder mode,
+**Overlay**, and **Exit**. Selecting a file while playback is active replaces the current
+clip immediately; while idle it only prepares the trigger. Folder playback also shows
+`Video N/total`.
+
+The diagnostics log is stored at
+`$XDG_STATE_HOME/obs-video-trigger/diagnostics.log` when that variable exists, otherwise
+at `%LOCALAPPDATA%\obs-video-trigger\diagnostics.log`.
 
 ---
 
@@ -212,6 +229,20 @@ obs-video-trigger.exe --stop
 
 Hides whatever is on screen right now.
 
+### Continuous random folder playback
+
+```
+obs-video-trigger.exe --play-folder "C:\Clips\Break"
+```
+
+The daemon shuffles the supported video files directly inside the folder, plays each one
+once, then creates another shuffled cycle for as long as needed. It avoids an immediate
+repeat at a cycle boundary and reserves/preloads one upcoming video for a seamless swap.
+Folders are never combined into one queue. Run the same command again to stop. The
+manager's **Next** button advances to the reserved item. **Stop** clears the queue so its
+next start reshuffles from scratch. `--volume` and `--fit` apply to every clip. A normal
+`--play` or `--stop` exits folder mode.
+
 ### Status
 
 ```
@@ -291,6 +322,7 @@ Deck **System → Website** action, or call it from any HTTP client.
 |---|---|
 | Play | `http://127.0.0.1:4466/play?file=C:\Clips\airhorn.mp4` |
 | Play, half volume, cropped | `http://127.0.0.1:4466/play?file=C:\Clips\airhorn.mp4&volume=0.5&fit=cover` |
+| Toggle random folder playback | `http://127.0.0.1:4466/play-folder?folder=C:\Clips\Break` |
 | Stop | `http://127.0.0.1:4466/stop` |
 | Status | `http://127.0.0.1:4466/status` |
 | The overlay page itself | `http://127.0.0.1:4466/overlay` |
@@ -330,8 +362,8 @@ Content-Type: application/json
   that is the browser, not the tool.
 - **Same file again while it is playing → stops it.** The key acts as a toggle. Trigger
   it again after it has finished and it plays from the start.
-- **Different file while one is playing → replaces it** immediately. Nothing is queued;
-  the newest trigger always wins.
+- **Different file while one is playing → replaces it seamlessly.** The new clip buffers
+  behind the current one and takes over when ready. Nothing is queued; the newest trigger wins.
 - **`--stop` at any time** clears the screen.
 - **Trigger with no overlay connected** does nothing visible; the command exits `1`.
 
@@ -419,6 +451,7 @@ Base URL: `http://127.0.0.1:4466` (or whatever `--host`/`--port` the daemon uses
 | Method | Path | Parameters | Reply |
 |---|---|---|---|
 | `GET` / `POST` | `/play` | `file` (required) — absolute path on the daemon's machine. `volume` (0–1). `fit` (`contain`, `cover`, `fill`; anything else falls back to `contain`). | `{"ok":true,"file":"<absolute path>","overlays":<n>}`, `400` for a missing or relative `file`, `404 {"ok":false,"error":"no such file: ..."}` |
+| `GET` / `POST` | `/play-folder` | `folder` (required) — absolute path. `volume` and `fit` as for `/play`. Calling it again with the active folder toggles it off. | `{"ok":true,"active":true,"folder":"...","clips":<n>,"overlays":<n>}` or `active:false` when toggled off. |
 | `GET` / `POST` | `/stop` | — | `{"ok":true,"overlays":<n>}` |
 | `GET` | `/status` | — | `{"ok":true,"overlays":<n>,"clips":<n>,"port":<n>,"audioDevice":"<name>"}` |
 | `GET` | `/audio-devices` | — | `{"ok":true,"overlays":<n>,"audioDevice":"<name>","devices":[{"id":"...","label":"..."}]}` as last reported by an overlay; `503` when no overlay is connected. |
@@ -485,5 +518,5 @@ curl -X POST "http://127.0.0.1:4466/shutdown?token=mysecret"
 | Clip letterboxed / cropped unexpectedly | Source size ≠ canvas, or `--fit` | Match width/height to the canvas; choose `--fit`. |
 | Clip cut short | Same key pressed again (toggle), another clip key (replace), or `--stop` | Expected behaviour. |
 | Old behaviour after updating the exe | OBS still has the old page | Right-click the source → **Refresh**. |
-| No tray icon, but clips work | PowerShell blocked | Stop via Task Manager or run from a terminal and use Ctrl+C. |
+| No tray icon, but clips work | Windows Explorer has not refreshed its notification area | Restart the daemon; if needed, restart Explorer. |
 | "Windows protected your PC" on first run | Binary is unsigned and carries the downloaded-from-internet mark | **More info → Run anyway** once, or remove the mark for good: right-click the exe → **Properties** → tick **Unblock** → **OK** (`Unblock-File .obs-video-trigger.exe` in PowerShell). |

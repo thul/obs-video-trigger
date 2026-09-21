@@ -1,0 +1,47 @@
+[package]
+name = "obs-video-trigger"
+version = "1.1.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Play local video clips in an OBS browser source"
+
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "ws"] }
+futures-util = "0.3"
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_UI_Shell",
+  "Win32_UI_Controls_Dialogs",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+winresource = "0.1"
